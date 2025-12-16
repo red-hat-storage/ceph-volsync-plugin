@@ -9,7 +9,7 @@ on:
   push:
     branches:
       - main
-      - 'release-*'
+      - "release-*"
 
 jobs:
   build:
@@ -76,7 +76,7 @@ jobs:
         with:
           registry: quay.io
           username: ${{ secrets.QUAY_USERNAME }}
-          password: ${{ secrets.QUAY_PASSWORD }}
+          password: ${{ secrets.QUAY_ROBOT_TOKEN }}
 
       - name: Build and push container image
         uses: docker/build-push-action@v6

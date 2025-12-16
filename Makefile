@@ -5,6 +5,10 @@
 # - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
 VERSION ?= 0.0.1
 
+# Creating the New CatalogSource requires publishing CSVs that replace one operator,
+# but can skip several. This can be accomplished using the skipRange annotation:
+SKIP_RANGE ?=
+
 # CHANNELS define the bundle channels used in the bundle.
 # Add a new line here if you would like to change its default config. (E.g CHANNELS = "candidate,fast,stable")
 # To re-generate a bundle for other specific channels without changing the standard setup, you can:
@@ -333,6 +337,9 @@ endif
 bundle: manifests kustomize operator-sdk ## Generate bundle manifests and metadata, then validate generated files.
 	$(OPERATOR_SDK) generate kustomize manifests -q
 	cd config/manager && $(KUSTOMIZE) edit set image controller=$(IMG)
+	cd config/manifests/bases && $(KUSTOMIZE) edit add annotation --force 'olm.skipRange':"$(SKIP_RANGE)"
+	cd config/manifests/bases && $(KUSTOMIZE) edit add patch --name ceph-volsync-plugin-operator.v0.0.1 --kind ClusterServiceVersion\
+		--patch '[{"op": "replace", "path": "/spec/replaces", "value": "$(REPLACES)"}]'
 	$(KUSTOMIZE) build config/manifests | $(OPERATOR_SDK) generate bundle $(BUNDLE_GEN_FLAGS)
 	$(OPERATOR_SDK) bundle validate ./bundle
 

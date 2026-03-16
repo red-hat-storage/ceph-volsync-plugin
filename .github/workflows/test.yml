@@ -48,6 +48,12 @@ jobs:
           cpus: 2
           cni: calico
 
+      - name: Setup tmate session
+        if: runner.debug == '1'
+        uses: mxschmitt/action-tmate@v3
+        with:
+          detached: true
+
       - name: Build, load and deploy ceph-volsync-plugin operator
         run: |
           IMG=localhost/ceph-volsync-plugin-operator:test

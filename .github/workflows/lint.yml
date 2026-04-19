@@ -1,23 +1,73 @@
+---
 name: Lint
 
 on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+# cancel the in-progress workflow when PR is refreshed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: true
+
 jobs:
-  lint:
-    name: Run on Ubuntu
+  codespell:
+    name: codespell
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Run codespell
+        uses: codespell-project/actions-codespell@v2
+        with:
+          ignore_words_list: BeforeAll,AfterAll,createRS
+
+  golangci-lint:
+    name: golangci-lint
     runs-on: ubuntu-latest
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+
+      - name: Install Ceph development headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            librados-dev librbd-dev libcephfs-dev
 
       - name: Run linter
         uses: golangci/golangci-lint-action@v8
         with:
-          version: v2.1.0
+          args: --build-tags=ceph_preview
+
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+
+      - name: Install Ceph development headers
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            librados-dev librbd-dev libcephfs-dev
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck -tags ceph_preview ./...

@@ -18,87 +18,54 @@ package e2e
 
 import (
 	"fmt"
-	"os"
-	"os/exec"
 	"testing"
 
+	volsyncv1alpha1 "github.com/backube/volsync/api/v1alpha1"
+	snapv1 "github.com/kubernetes-csi/external-snapshotter/client/v8/apis/volumesnapshot/v1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-
-	"github.com/RamenDR/ceph-volsync-plugin/test/utils"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
 var (
-	// Optional Environment Variables:
-	// - CERT_MANAGER_INSTALL_SKIP=true: Skips CertManager installation during test setup.
-	// These variables are useful if CertManager is already installed, avoiding
-	// re-installation and conflicts.
-	skipCertManagerInstall = os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true"
-	// isCertManagerAlreadyInstalled will be set true when CertManager CRDs be found on the cluster
-	isCertManagerAlreadyInstalled = false
+	// k8sClient is a controller-runtime client for typed
+	// access to VolSync CRDs and VolumeSnapshots.
+	k8sClient client.Client
 
-	// projectImage is the name of the image which will be build and loaded
-	// with the code source changes to be tested.
-	projectImage = "example.com/ceph-volsync-plugin-operator:v0.0.1"
-
-	// projectMoverImage is the name of the mover image which will be build and loaded
-	// with the code source changes to be tested.
-	projectMoverImage = "example.com/ceph-volsync-plugin-mover:v0.0.1"
+	// k8sClientSet is a client-go Clientset for typed
+	// access to core Kubernetes resources like PVCs.
+	k8sClientSet *kubernetes.Clientset
 )
 
 // TestE2E runs the end-to-end (e2e) test suite for the project. These tests execute in an isolated,
 // temporary environment to validate project changes with the purposed to be used in CI jobs.
-// The default setup requires Kind, builds/loads the Manager Docker image locally, and installs
+// The default setup requires Minikube, builds/loads the Manager Docker image locally, and installs
 // CertManager.
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
 	_, _ = fmt.Fprintf(GinkgoWriter, "Starting ceph-volsync-plugin-operator integration test suite\n")
-	RunSpecs(t, "e2e suite")
+	suiteConfig, reporterConfig := GinkgoConfiguration()
+	suiteConfig.FailFast = true
+	RunSpecs(t, "e2e suite", suiteConfig, reporterConfig)
 }
 
 var _ = BeforeSuite(func() {
-	By("building the manager(Operator) image")
-	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", projectImage))
-	_, err := utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager(Operator) image")
+	By("setting up controller-runtime client")
+	scheme := runtime.NewScheme()
+	Expect(clientgoscheme.AddToScheme(scheme)).To(Succeed())
+	Expect(volsyncv1alpha1.AddToScheme(scheme)).To(Succeed())
+	Expect(snapv1.AddToScheme(scheme)).To(Succeed())
 
-	// TODO(user): If you want to change the e2e test vendor from Kind, ensure the image is
-	// built and available before running the tests. Also, remove the following block.
-	By("loading the manager(Operator) image on Kind")
-	err = utils.LoadImageToKindClusterWithName(projectImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager(Operator) image into Kind")
+	cfg := ctrl.GetConfigOrDie()
+	var err error
+	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme})
+	Expect(err).NotTo(HaveOccurred())
+	Expect(k8sClient).NotTo(BeNil())
 
-	By("building the mover image")
-	cmd = exec.Command("make", "docker-build-mover", fmt.Sprintf("MOVER_IMG=%s", projectMoverImage))
-	_, err = utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the mover) image")
-
-	// TODO(user): If you want to change the e2e test vendor from Kind, ensure the image is
-	// built and available before running the tests. Also, remove the following block.
-	By("loading the manager(Operator) image on Kind")
-	err = utils.LoadImageToKindClusterWithName(projectMoverImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the mover image into Kind")
-
-	// The tests-e2e are intended to run on a temporary cluster that is created and destroyed for testing.
-	// To prevent errors when tests run in environments with CertManager already installed,
-	// we check for its presence before execution.
-	// Setup CertManager before the suite if not skipped and if not already installed
-	if !skipCertManagerInstall {
-		By("checking if cert manager is installed already")
-		isCertManagerAlreadyInstalled = utils.IsCertManagerCRDsInstalled()
-		if !isCertManagerAlreadyInstalled {
-			_, _ = fmt.Fprintf(GinkgoWriter, "Installing CertManager...\n")
-			Expect(utils.InstallCertManager()).To(Succeed(), "Failed to install CertManager")
-		} else {
-			_, _ = fmt.Fprintf(GinkgoWriter, "WARNING: CertManager is already installed. Skipping installation...\n")
-		}
-	}
-})
-
-var _ = AfterSuite(func() {
-	// Teardown CertManager after the suite if not skipped and if it was not already installed
-	if !skipCertManagerInstall && !isCertManagerAlreadyInstalled {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Uninstalling CertManager...\n")
-		utils.UninstallCertManager()
-	}
+	k8sClientSet, err = kubernetes.NewForConfig(cfg)
+	Expect(err).NotTo(HaveOccurred())
 })

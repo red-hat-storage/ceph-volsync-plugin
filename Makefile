@@ -1,9 +1,19 @@
+# Include build configuration (versions, base images).
+# Variables can be overridden on the CLI:
+#   make docker-build-mover GOLANG_VERSION=1.25.7
+-include build/build.env
+
 # VERSION defines the project version for the bundle.
 # Update this value when you upgrade the version of your project.
 # To re-generate a bundle for another specific version without changing the standard setup, you can:
 # - use the VERSION as arg of the bundle target (e.g make bundle VERSION=0.0.2)
 # - use environment variables to overwrite this value (e.g export VERSION=0.0.2)
 VERSION ?= 0.0.1
+
+# VOLSYNC_VERSION defines the VolSync version for CRD installation.
+# VolSync CRDs provide ReplicationSource and ReplicationDestination resources.
+# Override with: make install VOLSYNC_VERSION=v0.15.0
+VOLSYNC_VERSION ?= v0.14.0
 
 # Creating the New CatalogSource requires publishing CSVs that replace one operator,
 # but can skip several. This can be accomplished using the skipRange annotation:
@@ -62,6 +72,29 @@ IMG ?= $(IMAGE_TAG_BASE):v$(VERSION)
 # MOVER_IMG defines the image:tag used for the mover plugin image.
 MOVER_IMG ?= $(MOVER_IMAGE_TAG_BASE):v$(VERSION)
 
+# CEPH_CSI_CONFIG_NAME is the name of the ceph-csi ConfigMap the operator reads.
+CEPH_CSI_CONFIG_NAME ?= ceph-csi-config
+# CEPH_CSI_CONFIG_NAMESPACE is the namespace of the ceph-csi ConfigMap.
+CEPH_CSI_CONFIG_NAMESPACE ?= rook-ceph
+
+# Mover container --build-arg flags
+MOVER_BUILD_ARGS = \
+	--build-arg CEPH_BASE_IMAGE=$(CEPH_BASE_IMAGE) \
+	--build-arg CEPH_VERSION=$(CEPH_VERSION) \
+	--build-arg GOLANG_VERSION=$(GOLANG_VERSION) \
+	--build-arg RSYNC_VERSION=$(RSYNC_VERSION) \
+	--build-arg STUNNEL_VERSION=$(STUNNEL_VERSION)
+
+# PROTO_IMG defines the image:tag for the protoc code generation image.
+PROTO_IMG ?= ceph-volsync-plugin-protoc:latest
+
+# Proto container --build-arg flags
+PROTO_BUILD_ARGS = \
+	--build-arg GOLANG_VERSION=$(GOLANG_VERSION) \
+	--build-arg PROTOC_VERSION=$(PROTOC_VERSION) \
+	--build-arg PROTOC_GEN_GO_VERSION=$(PROTOC_GEN_GO_VERSION) \
+	--build-arg PROTOC_GEN_GO_GRPC_VERSION=$(PROTOC_GEN_GO_GRPC_VERSION)
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -104,11 +137,11 @@ help: ## Display this help.
 
 .PHONY: manifests
 manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and CustomResourceDefinition objects.
-	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./..." output:crd:artifacts:config=config/crd/bases
+	$(CONTROLLER_GEN) rbac:roleName=manager-role crd webhook paths="./internal/controller/..." output:crd:artifacts:config=config/crd/bases
 
 .PHONY: generate
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
-	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./..."
+	$(CONTROLLER_GEN) object:headerFile="hack/boilerplate.go.txt" paths="./internal/controller/..."
 
 .PHONY: fmt
 fmt: ## Run go fmt against code.
@@ -116,11 +149,11 @@ fmt: ## Run go fmt against code.
 
 .PHONY: vet
 vet: ## Run go vet against code.
-	go vet ./...
+	go vet -tags=ceph_preview ./...
 
 .PHONY: test
-test: manifests generate fmt vet setup-envtest ## Run tests.
-	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+test: manifests generate fmt vet proto-verify setup-envtest ## Run tests.
+	KUBEBUILDER_ASSETS="$(shell $(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -tags=ceph_preview $$(go list -tags=ceph_preview -f '{{if or (gt (len .TestGoFiles) 0) (gt (len .XTestGoFiles) 0)}}{{.ImportPath}}{{end}}' ./... | grep -v /e2e) -coverprofile cover.out
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
@@ -153,32 +186,73 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
-	$(GOLANGCI_LINT) run
+	$(GOLANGCI_LINT)  run --build-tags=ceph_preview ./...
 
 .PHONY: lint-fix
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
-	$(GOLANGCI_LINT) run --fix
+	$(GOLANGCI_LINT) run --fix --build-tags=ceph_preview ./...
 
 .PHONY: lint-config
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
 	$(GOLANGCI_LINT) config verify
 
+.PHONY: check-uncommitted
+check-uncommitted: ## Check for uncommitted changes in git
+	@if [ -n "$$(git status --porcelain)" ]; then \
+		echo "Error: Uncommitted changes detected:"; \
+		git status --porcelain; \
+		exit 1; \
+	else \
+		echo "✓ No uncommitted changes"; \
+	fi
+
+##@ Proto
+
+.PHONY: proto-image
+proto-image: ## Build the containerized protoc code generation image.
+	$(CONTAINER_TOOL) build $(PROTO_BUILD_ARGS) \
+		-t $(PROTO_IMG) -f build/Containerfile.protoc .
+
+.PHONY: proto-generate
+proto-generate: proto-image ## Regenerate gRPC stubs from .proto definitions.
+	find internal/proto -name '*.pb.go' -delete
+	$(CONTAINER_TOOL) run --rm \
+		-v $(PWD):/workspace:Z \
+		$(PROTO_IMG) \
+		--proto_path=internal/proto \
+		--go_out=internal/proto \
+		--go_opt=paths=source_relative \
+		--go-grpc_out=internal/proto \
+		--go-grpc_opt=paths=source_relative \
+		api/v1/sync.proto \
+		version/v1/version.proto
+
+.PHONY: proto-verify
+proto-verify: proto-generate ## Verify generated proto files match committed state.
+	@if [ -n "$$(git diff --name-only internal/proto/)" ]; then \
+		echo "Error: Generated proto files differ from committed:"; \
+		git diff --name-only internal/proto/; \
+		exit 1; \
+	else \
+		echo "✓ Generated proto files are up-to-date"; \
+	fi
+
 ##@ Build
 
 .PHONY: build
 build: manifests generate fmt vet ## Build manager binary.
-	go build -o bin/manager cmd/main.go
+	go build -o bin/manager cmd/manager/main.go
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
-	go run ./cmd/main.go
+	go run ./cmd/manager/main.go
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} -f build/Containerfile.manager .
+	$(CONTAINER_TOOL) build --build-arg GOLANG_VERSION=$(GOLANG_VERSION) -t ${IMG} -f build/Containerfile.manager .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -203,7 +277,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 
 .PHONY: docker-build-mover
 docker-build-mover: ## Build docker image with the mover.
-	$(CONTAINER_TOOL) build -t ${MOVER_IMG} -f build/Containerfile.mover .
+	$(CONTAINER_TOOL) build $(MOVER_BUILD_ARGS) -t ${MOVER_IMG} -f build/Containerfile.mover .
 
 .PHONY: docker-push-mover
 docker-push-mover: ## Push docker image with the mover.
@@ -215,7 +289,9 @@ docker-buildx-mover: ## Build and push docker image for the mover for cross-plat
 	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' build/Containerfile.mover > build/Containerfile.mover.cross
 	- $(CONTAINER_TOOL) buildx create --name ceph-volsync-plugin-mover-builder
 	$(CONTAINER_TOOL) buildx use ceph-volsync-plugin-mover-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${MOVER_IMG} -f build/Containerfile.mover.cross .
+	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) \
+		$(MOVER_BUILD_ARGS) \
+		--tag ${MOVER_IMG} -f build/Containerfile.mover.cross .
 	- $(CONTAINER_TOOL) buildx rm ceph-volsync-plugin-mover-builder
 	rm build/Containerfile.mover.cross
 
@@ -223,7 +299,7 @@ docker-buildx-mover: ## Build and push docker image for the mover for cross-plat
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default > dist/install.yaml
+	$(KUSTOMIZE) build config/default | sed 's|MOVER_IMAGE_PLACEHOLDER|${MOVER_IMG}|g; s|CEPH_CSI_CONFIG_NAME_PLACEHOLDER|${CEPH_CSI_CONFIG_NAME}|g; s|CEPH_CSI_CONFIG_NAMESPACE_PLACEHOLDER|${CEPH_CSI_CONFIG_NAMESPACE}|g' > dist/install.yaml
 
 ##@ Deployment
 
@@ -232,17 +308,17 @@ ifndef ignore-not-found
 endif
 
 .PHONY: install
-install: manifests kustomize ## Install CRDs into the K8s cluster specified in ~/.kube/config.
-	$(KUSTOMIZE) build config/crd | $(KUBECTL) apply -f -
+install: ## Install VolSync CRDs into K8s cluster.
+	VOLSYNC_VERSION=$(VOLSYNC_VERSION) test/scripts/install_volsync.sh install
 
 .PHONY: uninstall
-uninstall: manifests kustomize ## Uninstall CRDs from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
-	$(KUSTOMIZE) build config/crd | $(KUBECTL) delete --ignore-not-found=$(ignore-not-found) -f -
+uninstall: ## Uninstall VolSync CRDs from K8s cluster.
+	test/scripts/install_volsync.sh cleanup
 
 .PHONY: deploy
 deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in ~/.kube/config.
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
-	$(KUSTOMIZE) build config/default | $(KUBECTL) apply -f -
+	$(KUSTOMIZE) build config/default | sed 's|MOVER_IMAGE_PLACEHOLDER|${MOVER_IMG}|g; s|CEPH_CSI_CONFIG_NAME_PLACEHOLDER|${CEPH_CSI_CONFIG_NAME}|g; s|CEPH_CSI_CONFIG_NAMESPACE_PLACEHOLDER|${CEPH_CSI_CONFIG_NAMESPACE}|g' | $(KUBECTL) apply -f -
 
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
@@ -270,7 +346,7 @@ CONTROLLER_TOOLS_VERSION ?= v0.18.0
 ENVTEST_VERSION ?= $(shell go list -m -f "{{ .Version }}" sigs.k8s.io/controller-runtime | awk -F'[v.]' '{printf "release-%d.%d", $$2, $$3}')
 #ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
 ENVTEST_K8S_VERSION ?= $(shell go list -m -f "{{ .Version }}" k8s.io/api | awk -F'[v.]' '{printf "1.%d", $$3}')
-GOLANGCI_LINT_VERSION ?= v2.1.0
+GOLANGCI_LINT_VERSION ?= v2.11.3
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.

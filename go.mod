@@ -1,6 +1,6 @@
 module github.com/RamenDR/ceph-volsync-plugin
 
-go 1.26.9
+go 1.26.7
 
 require (
 	github.com/backube/volsync v0.11.0
